@@ -5,3 +5,7 @@ Point Cloud Reconstruction
 4. Running on image pairs OR dual live video streams.
 
 Clean utilities in ``utils.py`` + a simple runner to visualize ``visualization.ipynb``
+
+The individual ``utils`` for either RAFT-Stereo or PSMNet are under their own directories. 
+
+``utils.py`` is created by the repo owner. 
