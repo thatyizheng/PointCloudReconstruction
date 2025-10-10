@@ -245,78 +245,88 @@ def generate_pointcloud(
 # ======================================================================================
 # Project/transform point cloud and compute uL/uR on original images
 # ======================================================================================
-def transform_pointcloud(pcd, stereo_params, pcd_frame="rectified_left"):
+def pcd_to_rectified_images(pcd, stereo_params, image_size):
     """
-    Transform a point cloud (or Nx3 array) to original left/right camera frames
-    and project to pixels uL/uR (with lens distortion).
-
+    将点云(整左坐标)投影到 rectified-left / rectified-right 平面并生成点图。
     Args:
-        pcd (open3d.geometry.PointCloud or np.ndarray): 3D points. If generated
-            from rectified disparity + Q, it is typically in the rectified-left
-            camera frame.
-        stereo_params (dict): Must include:
-            'K_L','D_L','K_R','D_R','R','T','R_L' (float64 recommended).
-        pcd_frame (str): 'rectified_left' (default) or 'original_left'.
-
+        pcd : Nx3 array or open3d.PointCloud (rectified-left coordinates)
+        stereo_params : 包含 'R','T','R_L','R_R','P_L','P_R'
+        image_size : (W, H)
     Returns:
-        tuple:
-            left_pts_cam  (N,3)  points in original-left camera coordinates
-            right_pts_cam (N,3)  points in original-right camera coordinates
-            uL            (N,2)  pixel coords in original-left image (with distortion)
-            uR            (N,2)  pixel coords in original-right image (with distortion)
-
-    Notes:
-        - If pcd is in rectified-left coordinates, X_orig_L = R_L^T * X_rect_L.
-        - Projection uses cv2.projectPoints with rvec=tvec=0 because points are
-          already in each camera’s coordinate system.
-        - No Z>0 filtering here (kept same as your function). You can mask later if needed.
+        img_rect_L, img_rect_R  (黑底彩色点层)
     """
-    # Extract Nx3 points
     if hasattr(pcd, "points"):
-        pts = np.asarray(pcd.points, dtype=np.float64)
-    else:                   
-        pts = np.asarray(pcd, dtype=np.float64)
-    assert pts.ndim == 2 and pts.shape[1] == 3, "pcd must be (N,3) or an Open3D PointCloud"
-
-    # Calibration (float64)
-    K_L = stereo_params['K_L'].astype(np.float64)
-    D_L = stereo_params['D_L'].astype(np.float64)
-    K_R = stereo_params['K_R'].astype(np.float64)
-    D_R = stereo_params['D_R'].astype(np.float64)
-    R   = stereo_params['R'  ].astype(np.float64)                # left -> right
-    T   = stereo_params['T'  ].astype(np.float64).reshape(3,1)   # (3,1)
-    R_L = stereo_params['R_L'].astype(np.float64)                # rectification rotation (left)
-
-    # Rectified-left -> Original-left  (X_orig_L = R_L^T * X_rect_L)
-    if pcd_frame == "rectified_left":
-        left_orig_all = pts @ R_L.T
-    elif pcd_frame == "original_left":
-        left_orig_all = pts.copy()
+        pts_rectL = np.asarray(pcd.points, dtype=np.float64)
     else:
-        raise ValueError("pcd_frame must be 'rectified_left' or 'original_left'")
+        pts_rectL = np.asarray(pcd, dtype=np.float64)
+    assert pts_rectL.ndim == 2 and pts_rectL.shape[1] == 3
 
-    # Project to original-left pixels
-    uL, _ = cv2.projectPoints(
-        left_orig_all.reshape(-1,1,3),
-        rvec=np.zeros((3,1), np.float64),
-        tvec=np.zeros((3,1), np.float64),
-        cameraMatrix=K_L,
-        distCoeffs=D_L
+    # pts_rectL[:,0]*=-1
+    W, H = image_size
+
+    # === rectified-left 投影 ===
+    P_L = stereo_params['P_L'].astype(np.float64)
+    KpL = P_L[:3, :3]
+    uL_rect, _ = cv2.projectPoints(
+        pts_rectL.reshape(-1, 1, 3),
+        np.zeros((3,1)), np.zeros((3,1)),
+        KpL, np.zeros(5)
     )
-    uL = uL.reshape(-1, 2)
+    uL_rect = uL_rect.reshape(-1, 2)
 
-    # Original-left -> Original-right (X_R = R X_L + T), then project to pixels
-    right_orig_all = (R @ left_orig_all.T).T + T.reshape(1,3)
-    uR, _ = cv2.projectPoints(
-        right_orig_all.reshape(-1,1,3),
-        rvec=np.zeros((3,1), np.float64),
-        tvec=np.zeros((3,1), np.float64),
-        cameraMatrix=K_R,
-        distCoeffs=D_R
+    # === rectified-right 投影 ===
+    R_L = stereo_params['R_L'].astype(np.float64)
+    R_R = stereo_params['R_R'].astype(np.float64)
+    R   = stereo_params['R'].astype(np.float64)
+    T   = stereo_params['T'].astype(np.float64).reshape(3,1)
+
+    R_rect = R_R @ R @ R_L.T
+    T_rect = (R_R @ T).reshape(1,3)
+
+    X_R_rect = (R_rect @ pts_rectL.T).T + T_rect
+
+    P_R = stereo_params['P_R'].astype(np.float64)
+    KpR = P_R[:3, :3]
+    uR_rect, _ = cv2.projectPoints(
+        X_R_rect.reshape(-1,1,3),
+        np.zeros((3,1)), np.zeros((3,1)),
+        KpR, np.zeros(5)
     )
-    uR = uR.reshape(-1, 2)
+    uR_rect = uR_rect.reshape(-1,2)
 
-    return left_orig_all, right_orig_all, uL, uR
+    # === 绘制点图 ===
+    img_rect_L = np.zeros((H, W, 3), np.uint8)
+    img_rect_R = np.zeros((H, W, 3), np.uint8)
+
+    uvL = np.rint(uL_rect).astype(int)
+    uvR = np.rint(uR_rect).astype(int)
+    for x, y in uvL:
+        if 0 <= x < W and 0 <= y < H:
+            cv2.circle(img_rect_L, (x, y), 1, (0, 0, 255), -1)
+    for x, y in uvR:
+        if 0 <= x < W and 0 <= y < H:
+            cv2.circle(img_rect_R, (x, y), 1, (0, 0, 255), -1)
+
+    return img_rect_L, img_rect_R
+
+def inverse_remap_rectified_to_original(rectified_img, stereo_params, camera="left"):
+    """
+    将整流图像反整流回原始图像平面
+    """
+    H, W = rectified_img.shape[:2]
+    if camera == "left":
+        P = stereo_params["P_L"].astype(np.float64)
+        R_rect = stereo_params["R_L"].astype(np.float64)
+        K = stereo_params["K_L"].astype(np.float64)
+    else:
+        P = stereo_params["P_R"].astype(np.float64)
+        R_rect = stereo_params["R_R"].astype(np.float64)
+        K = stereo_params["K_R"].astype(np.float64)
+
+    P3 = P[:3, :3]
+    mapx, mapy = cv2.initUndistortRectifyMap(P3, np.zeros(5), R_rect.T, K, (W, H), cv2.CV_32FC1)
+    img_orig = cv2.remap(rectified_img, mapx, mapy, cv2.INTER_NEAREST)
+    return img_orig
 
 # ======================================================================================
 # Visualization helper for u (overlay, points-only, or both)
@@ -324,70 +334,79 @@ def transform_pointcloud(pcd, stereo_params, pcd_frame="rectified_left"):
 def overlay_pointcloud_image(
     img_bgr: np.ndarray,
     u: np.ndarray,
-    radius: int = 3,            # point radius
-    alpha: float = 0.6,         # overlay strength [0..1]
-    tint_strength: float = 0.7, # how strongly to push colors toward red [0..1]
-    blur: int = 0,              # optional Gaussian blur for the point layer; 0 = off
+    radius: int = 3,
+    alpha: float = 0.6,
+    tint_strength: float = 0.7,
+    blur: int = 0,
     mode: str = "overlay"       # "overlay" | "points_only" | "both"
 ):
     """
-    Visualize projected points u on top of an image.
+    Visualize projected points or a pre-rendered point layer on top of an image.
 
     Modes:
         - "overlay":     return a single image with a red-tinted fog over original
         - "points_only": return only the red-tinted point layer on black
         - "both":        return (overlay_image, points_only_image)
 
-    Args/Returns:
+    Args:
         img_bgr (np.ndarray): Base image (H,W,3) BGR.
-        u (np.ndarray): Nx2 pixel coordinates.
-        radius/alpha/tint_strength/blur/mode: visualization controls.
-        Returns either a single image or a tuple of two images depending on mode.
+        u (np.ndarray): Either Nx2 pixel coordinates, or an (H,W,3) mask/layer image.
+        radius, alpha, tint_strength, blur, mode: visualization controls.
 
-    Notes:
-        - Colors for each point are sampled from the base image at u, then pushed
-          toward red by 'tint_strength', then optionally blurred and alpha-composited.
-        - Coordinates outside image bounds are ignored.
-        - No disk I/O is performed; use cv2.imshow / cv2.imwrite as needed outside.
+    Behavior:
+        - If u is (H,W,3): treat it as a ready-made "point layer" and alpha blend.
+        - If u is (N,2): draw red-tinted points on img_bgr.
     """
 
     H, W = img_bgr.shape[:2]
-    if u.size == 0:
-        return (img_bgr.copy(), np.zeros((H,W,3),np.uint8)) if mode=="both" \
-               else (img_bgr.copy() if mode=="overlay" else np.zeros((H,W,3),np.uint8))
 
-    # Bound check & color sampling
+    # ✅ Case 1: u 是图像层 (H, W, 3)
+    if u.ndim == 3 and u.shape[:2] == (H, W):
+        overlay_only = u.copy()
+        # 若输入是灰度或单通道，可自动扩展
+        if overlay_only.ndim == 2:
+            overlay_only = cv2.cvtColor(overlay_only, cv2.COLOR_GRAY2BGR)
+        if blur and blur >= 2:
+            overlay_only = cv2.GaussianBlur(overlay_only, (blur|1, blur|1), 0)
+        if mode == "points_only":
+            return overlay_only
+        overlay_on_img = cv2.addWeighted(overlay_only, alpha, img_bgr, 1.0, 0)
+        if mode == "both":
+            return overlay_on_img, overlay_only
+        else:
+            return overlay_on_img
+
+    # ✅ Case 2: u 是 Nx2 坐标数组
+    if u.size == 0:
+        return (img_bgr.copy(), np.zeros((H, W, 3), np.uint8)) if mode == "both" \
+               else (img_bgr.copy() if mode == "overlay" else np.zeros((H, W, 3), np.uint8))
+
     uv = np.rint(u).astype(int)
-    inb = (uv[:,0]>=0)&(uv[:,0]<W)&(uv[:,1]>=0)&(uv[:,1]<H)
+    inb = (uv[:, 0] >= 0) & (uv[:, 0] < W) & (uv[:, 1] >= 0) & (uv[:, 1] < H)
     if not np.any(inb):
-        return (img_bgr.copy(), np.zeros((H,W,3),np.uint8)) if mode=="both" \
-               else (img_bgr.copy() if mode=="overlay" else np.zeros((H,W,3),np.uint8))
+        return (img_bgr.copy(), np.zeros((H, W, 3), np.uint8)) if mode == "both" \
+               else (img_bgr.copy() if mode == "overlay" else np.zeros((H, W, 3), np.uint8))
     uv = uv[inb]
-    xs, ys = uv[:,0], uv[:,1]
-    cols = img_bgr[ys, xs].astype(np.float32)  # BGR from image
+    xs, ys = uv[:, 0], uv[:, 1]
+    cols = img_bgr[ys, xs].astype(np.float32)
 
     # Push sampled colors toward red
     s = float(np.clip(tint_strength, 0.0, 1.0))
-    red = np.zeros_like(cols); red[:,2] = 255.0
+    red = np.zeros_like(cols); red[:, 2] = 255.0
     tinted = np.clip((1.0 - s) * cols + s * red, 0, 255).astype(np.uint8)
 
-    # Draw a pure point layer (black background)
     overlay_only = np.zeros_like(img_bgr, dtype=np.uint8)
     r = max(1, int(radius))
     for (x, y), c in zip(uv, tinted):
         cv2.circle(overlay_only, (int(x), int(y)), r, tuple(int(v) for v in c), -1, cv2.LINE_AA)
 
-    # Optional blur for a softer "fog" look
     if blur and blur >= 2:
         overlay_only = cv2.GaussianBlur(overlay_only, (blur|1, blur|1), 0)
 
     if mode == "points_only":
         return overlay_only
 
-    # Alpha blend with base image
-    a = float(np.clip(alpha, 0.0, 1.0))
-    overlay_on_img = cv2.addWeighted(overlay_only, a, img_bgr, 1.0, 0)
-
+    overlay_on_img = cv2.addWeighted(overlay_only, alpha, img_bgr, 1.0, 0)
     if mode == "overlay":
         return overlay_on_img
     elif mode == "both":
